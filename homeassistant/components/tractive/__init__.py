@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -17,11 +18,12 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
     Platform,
 )
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_call_later
 
 from .const import (
     ATTR_DAILY_GOAL,
@@ -40,6 +42,7 @@ from .const import (
     TRACKER_HEALTH_OVERVIEW_UPDATED,
     TRACKER_POSITION_UPDATED,
     TRACKER_SWITCH_STATUS_UPDATED,
+    UNAVAILABLE_AFTER,
 )
 
 PLATFORMS = [
@@ -214,7 +217,7 @@ class TractiveClient:
         hass: HomeAssistant,
         client: aiotractive.Tractive,
         user_id: str,
-        config_entry: ConfigEntry,
+        config_entry: TractiveConfigEntry,
     ) -> None:
         """Initialize the client."""
         self._hass = hass
@@ -224,6 +227,8 @@ class TractiveClient:
         self._last_pos_time = 0
         self._listen_task: asyncio.Task | None = None
         self._config_entry = config_entry
+        self._cancel_unavailable_timer: CALLBACK_TYPE | None = None
+        self._unavailable_sent = False
 
     @property
     def user_id(self) -> str:
@@ -246,17 +251,24 @@ class TractiveClient:
         """Stop event listener coroutine."""
         if self._listen_task:
             self._listen_task.cancel()
+        self._stop_unavailable_timer()
         await self._client.close()
 
     async def _listen(self) -> None:
-        server_was_unavailable = False
+        connection_lost = False
         while True:
             try:
                 async for event in self._client.events():
                     _LOGGER.debug("Received event: %s", event)
-                    if server_was_unavailable:
-                        _LOGGER.debug("Tractive is back online")
-                        server_was_unavailable = False
+                    # The channel opens with the full status of every tracker,
+                    # so the first event shows the connection is back
+                    if connection_lost:
+                        connection_lost = False
+                        self._stop_unavailable_timer()
+                        if self._unavailable_sent:
+                            _LOGGER.info("Tractive is back online")
+                            self._unavailable_sent = False
+                            await self._async_refresh_health_overview()
                     if event["message"] == "health_overview":
                         self.send_health_overview_update(event)
                         continue
@@ -289,21 +301,53 @@ class TractiveClient:
                 _LOGGER.error("Error while listening for events: %s", error)
                 continue
             except aiotractive.exceptions.TractiveError:
-                _LOGGER.debug(
-                    (
-                        "Tractive is not available. Internet connection is down?"
-                        " Sleeping %i seconds and retrying"
-                    ),
-                    RECONNECT_INTERVAL.total_seconds(),
-                )
+                if not connection_lost:
+                    connection_lost = True
+                    _LOGGER.debug(
+                        "Tractive is not available. Retrying every %i seconds",
+                        RECONNECT_INTERVAL.total_seconds(),
+                    )
+                    # A timer, because the library may retry connect timeouts
+                    # forever without raising again
+                    self._cancel_unavailable_timer = async_call_later(
+                        self._hass, UNAVAILABLE_AFTER, self._async_mark_unavailable
+                    )
                 self._last_hw_time = 0
                 self._last_pos_time = 0
-                async_dispatcher_send(
-                    self._hass, f"{SERVER_UNAVAILABLE}-{self._user_id}"
-                )
                 await asyncio.sleep(RECONNECT_INTERVAL.total_seconds())
-                server_was_unavailable = True
                 continue
+
+    @callback
+    def _async_mark_unavailable(self, _: datetime) -> None:
+        """Mark the entities unavailable after a long outage."""
+        self._cancel_unavailable_timer = None
+        _LOGGER.info(
+            "Tractive has been unavailable for %s, marking entities unavailable",
+            UNAVAILABLE_AFTER,
+        )
+        self._unavailable_sent = True
+        async_dispatcher_send(self._hass, f"{SERVER_UNAVAILABLE}-{self._user_id}")
+
+    def _stop_unavailable_timer(self) -> None:
+        if self._cancel_unavailable_timer is not None:
+            self._cancel_unavailable_timer()
+            self._cancel_unavailable_timer = None
+
+    async def _async_refresh_health_overview(self) -> None:
+        """Fetch the health overview, which the channel does not replay."""
+        for item in self._config_entry.runtime_data.trackables:
+            try:
+                health_overview = await self._client.trackable_object(
+                    item.trackable["_id"]
+                ).health_overview()
+            except aiotractive.exceptions.UnauthorizedError:
+                raise
+            except aiotractive.exceptions.TractiveError as error:
+                # Not worth dropping a working channel, the next event catches up
+                _LOGGER.debug("Failed to refresh the health overview: %s", error)
+                continue
+            if health_overview:
+                self.send_health_overview_update(health_overview)
 
     def _send_hardware_update(self, event: dict[str, Any]) -> None:
         # Sometimes hardware event doesn't contain complete data.
