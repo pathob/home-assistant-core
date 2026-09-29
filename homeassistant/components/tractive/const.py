@@ -5,6 +5,8 @@ from datetime import timedelta
 DOMAIN = "tractive"
 
 RECONNECT_INTERVAL = timedelta(seconds=10)
+# How long the event channel may be down before the entities become unavailable
+UNAVAILABLE_AFTER = timedelta(minutes=5)
 
 ATTR_BUZZER = "buzzer"
 ATTR_DAILY_GOAL = "daily_goal"
